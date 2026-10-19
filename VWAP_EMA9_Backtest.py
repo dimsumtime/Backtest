@@ -51,6 +51,11 @@ TYPE_FIELD   = 2
 TRADE_TYPE   = "2"      # type 2 = Last/Trade tick
 PRICE_FIELD  = 3
 VOLUME_FIELD = 4
+FILES_SORTED = True     # tick lines are in time order: read only the needed window (much faster)
+
+# Parallel workers. On a USB spinning drive (LaCie) 2-4 is often FASTER than 8 for the first
+# (uncached) run because parallel reads make the disk seek back and forth. Cached runs: use more.
+WORKERS = min(cpu_count(), 8)
 
 TICK_SIZE   = 0.25
 POINT_VALUE = 20.0      # $ per point per contract: NQ 20, MNQ 2, ES 50, MES 5
@@ -190,18 +195,51 @@ def ts_to_epoch(ts_int):
 # ------------------------------------------------------------
 #  Tick loading (+ binary cache)
 # ------------------------------------------------------------
+def _seek_to(f, size, target):
+    """Binary-search a time-sorted tick file for the first line with timestamp >= target,
+    so only the needed window is read (the overnight hours are skipped without reading them)."""
+    lo, hi = 0, size
+    while hi - lo > 1 << 16:
+        mid = (lo + hi) // 2
+        f.seek(mid)
+        f.readline()                       # skip the partial line we landed in
+        line = f.readline()
+        while line and not line[:1].isdigit():
+            line = f.readline()
+        if not line or line[:14] >= target:
+            hi = mid
+        else:
+            lo = mid
+    f.seek(lo)
+    if lo:
+        f.readline()
+
+
 def scan_file(filepath, start_ep, end_ep, ep, px, vol):
     """Append type=2 (trade) ticks within [start, end) to ep/px/vol.
-    Fast pre-filter on the raw 14-char timestamp string before splitting the line."""
-    start_s = str(epoch_to_utc_int(start_ep))
-    end_s = str(epoch_to_utc_int(end_ep))
-    with open(filepath, "r") as f:
+    With FILES_SORTED, seeks to the window start and stops at the window end; otherwise
+    scans the whole file with a fast pre-filter on the raw 14-char timestamp."""
+    start_b = str(epoch_to_utc_int(start_ep)).encode()
+    end_b = str(epoch_to_utc_int(end_ep)).encode()
+    trade_b = TRADE_TYPE.encode()
+    last = b""
+    with open(filepath, "rb", buffering=1 << 20) as f:
+        if FILES_SORTED:
+            _seek_to(f, os.fstat(f.fileno()).st_size, start_b)
         for line in f:
             ts_raw = line[:14]
-            if ts_raw < start_s or ts_raw >= end_s:
+            if ts_raw < start_b:
                 continue
-            parts = line.split(";")
-            if len(parts) <= VOLUME_FIELD or parts[TYPE_FIELD] != TRADE_TYPE:
+            if ts_raw >= end_b:
+                if FILES_SORTED and ts_raw[:1].isdigit():
+                    break
+                continue
+            if FILES_SORTED:
+                if ts_raw < last:
+                    raise RuntimeError(f"{filepath} is not in time order — set FILES_SORTED = True ")
+                last = ts_raw
+            parts = line.split(b";")
+            if len(parts) <= VOLUME_FIELD or parts[TYPE_FIELD] != trade_b:
                 continue
             ep.append(ts_to_epoch(int(ts_raw)))
             px.append(float(parts[PRICE_FIELD]))
@@ -791,20 +829,25 @@ def main():
             continue
         tasks.append((fp, csv_files[i - 1] if i > 0 else None))
 
-    workers = min(cpu_count(), 8)
+    workers = WORKERS
     print(f"\n  {len(tasks)} daily files — {len(COMBOS)} combo(s) — {workers} workers\n")
 
     per_combo = [[] for _ in COMBOS]
     with Pool(workers) as pool:
-        for date_str, day_results in pool.imap(process_day, tasks):
+        for done, (date_str, day_results) in enumerate(pool.imap(process_day, tasks), 1):
+            elapsed = time.time() - t0
+            eta = elapsed / done * (len(tasks) - done)
+            progress = f"[{done}/{len(tasks)} {elapsed / 60:.0f}m, ~{eta / 60:.0f}m left]"
             if not day_results:
                 continue
             for ci, res in enumerate(day_results):
                 per_combo[ci].extend(res)
             if not GRID and day_results[0]:
                 res = day_results[0]
-                print(f"  {date_str}  ${sum(r['net'] for r in res):+9.2f}  " + ", ".join(
+                print(f"  {progress} {date_str}  ${sum(r['net'] for r in res):+9.2f}  " + ", ".join(
                     f"{r['side'][0].upper()} {r['entry_time'][:5]}→{r['exit_type']} {r['net']:+.0f}" for r in res))
+            elif GRID and (done % 10 == 0 or done == len(tasks)):
+                print(f"  {progress} {date_str}")
 
     for trades in per_combo:
         trades.sort(key=lambda r: r["entry_epoch"])
