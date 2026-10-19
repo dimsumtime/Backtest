@@ -30,3 +30,13 @@ Every filter is OFF by default: session, direction, minimum EMA–VWAP distance,
   - Slippage 1–2 ticks.
   - Turn on Bar Magnifier if your plan has it.
 - Test the baseline first. Then add one filter at a time, such as a 09:30–15:45 session with flatten, and compare out-of-sample periods.
+
+## Python tick-data backtester (`VWAP_EMA9_Backtest.py`)
+This is a port of the Pine strategy. It reads the same MarketTick L1 tick CSVs as `ORB_Backtest.py`: semicolon-separated, UTC timestamps, type `2` = trade.
+- Ticks are grouped into N-minute bars (3 minutes by default). Signals come from closed bars, and orders fill on the first tick of the next bar.
+- Stops, targets and the trailing stop are checked on every tick.
+- Settings go in `PARAMS` at the top of the file. They have the same names as the Pine inputs.
+- To optimize, fill in `GRID`. Each day's ticks are read once and every setting combination runs on them.
+- Set `OOS_START` to report out-of-sample results separately.
+- Before the first run, check `VOLUME_FIELD`, which is the column holding trade volume. VWAP needs it.
+- Run `python3 VWAP_EMA9_Backtest.py`. Trades go to `VWAP_EMA9_Trades.csv`, and grid results go to `VWAP_EMA9_Grid.csv`.
