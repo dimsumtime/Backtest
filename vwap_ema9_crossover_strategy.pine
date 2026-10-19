@@ -1,0 +1,457 @@
+//@version=6
+// =============================================================================
+//  VWAP + 9 EMA Crossover Strategy  (Pine Script v6)
+// -----------------------------------------------------------------------------
+//  Baseline logic (default settings):
+//    • LONG  when EMA(9) crosses ABOVE session VWAP (only when flat)
+//    • SHORT when EMA(9) crosses BELOW session VWAP (only when flat)
+//    • Exit  when a candle closes back through EMA(9)       (Stop Method 1)
+//    • Catastrophic fixed stop at 25% of position value     (Stop Method 2)
+//
+//  Everything else (filters, take-profits, trailing, break-even, daily limits)
+//  is OPTIONAL and OFF by default so the raw crossover can be tested alone.
+//
+//  Non-repainting design:
+//    • Signals are evaluated only on confirmed (closed) bars.
+//    • calc_on_every_tick = false, so realtime behaves like history.
+//    • Optional higher-timeframe signals use the [1] + lookahead_on pattern,
+//      which only ever reads COMPLETED higher-timeframe bars.
+//    • Market orders fill on the NEXT bar's open (no same-bar look-ahead).
+//
+//  Commission / slippage / initial capital are set in strategy() below and can
+//  be changed any time in the "Properties" tab of the strategy settings.
+// =============================================================================
+strategy(title = "VWAP + 9 EMA Crossover Strategy", shorttitle = "VWAP x EMA9", overlay = true,
+     pyramiding = 0,
+     initial_capital = 50000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.1,
+     slippage = 1,
+     margin_long = 10,
+     margin_short = 10,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     fill_orders_on_standard_ohlc = true)
+
+// =============================================================================
+// INPUT GROUPS
+// =============================================================================
+const string G_IND   = "1) Indicators"
+const string G_ENTRY = "2) Entries"
+const string G_SL    = "3) Stop-Loss"
+const string G_TP    = "4) Take-Profit / Exits"
+const string G_FILT  = "5) Filters (all OFF by default)"
+const string G_RISK  = "6) Risk Management"
+const string G_VIS   = "7) Visuals"
+
+// ---- 1) Indicators ----------------------------------------------------------
+int    emaLen     = input.int(9, "EMA Length", minval = 1, group = G_IND)
+float  emaSrc     = input.source(close, "EMA Source", group = G_IND)
+float  vwapSrc    = input.source(hlc3, "VWAP Source", group = G_IND)
+string vwapAnchor = input.string("Session", "VWAP Anchor", options = ["Session", "RTH (09:30 NY)", "Week", "Month"], group = G_IND,
+     tooltip = "Session = resets at the start of each exchange trading day (18:00 ET for CME futures).\nRTH = resets at the 09:30 New York cash open.")
+
+// ---- 2) Entries -------------------------------------------------------------
+bool confirmClose = input.bool(false, "Require Candle-Close Confirmation", group = G_ENTRY,
+     tooltip = "Signals are ALWAYS evaluated on a closed candle (no intrabar signals).\nWhen ON, the signal candle must additionally CLOSE above both EMA and VWAP for longs (below both for shorts).")
+
+// ---- 3) Stop-Loss -----------------------------------------------------------
+bool   useEmaStop   = input.bool(true, "Method 1: EMA Close Exit", group = G_SL,
+     tooltip = "Long: exit when a candle closes below the EMA.\nShort: exit when a candle closes above the EMA.\nThe exit fills at the next bar's open.")
+bool   useFixedStop = input.bool(true, "Method 2: Fixed Stop-Loss", group = G_SL,
+     tooltip = "Hard stop order resting in the market. Its distance also defines 1R for the Risk:Reward target, break-even and risk-based sizing.")
+string stopMode     = input.string("% of Position Value", "Fixed Stop Type", options = ["% of Position Value", "Points", "Ticks"], group = G_SL)
+float  stopPct      = input.float(25.0, "Stop: % of Position Value", minval = 0.01, maxval = 100.0, step = 0.5, group = G_SL,
+     tooltip = "Loss as % of the position's notional value (25-30% per the original rules). On index futures this is a very wide, catastrophic-only stop; use Points/Ticks for a realistic intraday stop.")
+float  stopPts      = input.float(25.0, "Stop: Points", minval = 0.01, step = 0.25, group = G_SL)
+int    stopTicks    = input.int(100, "Stop: Ticks", minval = 1, group = G_SL)
+
+// ---- 4) Take-Profit / Exits -------------------------------------------------
+string tpMode      = input.string("None", "Take-Profit Method", options = ["None", "Risk:Reward", "Fixed Points", "Fixed Ticks", "Opposite Crossover", "EMA 9 Close (in profit)"], group = G_TP,
+     tooltip = "None = baseline (exits come only from the stop-loss methods).\nRisk:Reward = limit order at N x the fixed-stop distance.\nOpposite Crossover = close when EMA crosses VWAP the other way.\nEMA 9 Close (in profit) = close on a candle close through the EMA, but only while the trade is in profit.")
+string rrSel       = input.string("1:2", "Risk:Reward Ratio", options = ["1:1", "1:1.5", "1:2", "1:3"], group = G_TP)
+float  tpPts       = input.float(50.0, "Take-Profit: Points", minval = 0.01, step = 0.25, group = G_TP)
+int    tpTicks     = input.int(200, "Take-Profit: Ticks", minval = 1, group = G_TP)
+bool   useTrail    = input.bool(false, "Enable Trailing Stop", group = G_TP)
+float  trailActPts = input.float(20.0, "Trail Activation (Points in profit)", minval = 0.0, step = 0.25, group = G_TP)
+float  trailOffPts = input.float(10.0, "Trail Offset (Points)", minval = 0.25, step = 0.25, group = G_TP)
+
+// ---- 5) Filters (all OFF by default) ---------------------------------------
+string tradeDirection = input.string("Both", "Trade Direction", options = ["Both", "Long Only", "Short Only"], group = G_FILT)
+bool   useSigTF       = input.bool(false, "Use Higher Signal Timeframe", inline = "tf", group = G_FILT)
+string sigTFIn        = input.timeframe("15", "", inline = "tf", group = G_FILT,
+     tooltip = "Computes EMA/VWAP/close on this timeframe using only COMPLETED bars (non-repainting). Must be >= chart timeframe.")
+bool   useSession     = input.bool(false, "Trading Session Filter", inline = "ses", group = G_FILT)
+string sessIn         = input.session("0930-1600", "", inline = "ses", group = G_FILT)
+string sessTZ         = input.string("America/New_York", "Session Timezone", group = G_FILT)
+bool   flatOutside    = input.bool(false, "Flatten Positions Outside Session", group = G_FILT)
+bool   useMinDist     = input.bool(false, "Min EMA-VWAP Distance", inline = "dist", group = G_FILT)
+float  minDist        = input.float(2.0, "", minval = 0.0, step = 0.25, inline = "dist", group = G_FILT)
+string distUnit       = input.string("Points", "", options = ["Points", "Ticks"], inline = "dist", group = G_FILT)
+bool   useVolFilter   = input.bool(false, "Volume Filter: Vol >= SMA x Mult", group = G_FILT)
+int    volLen         = input.int(20, "  Volume SMA Length", minval = 1, group = G_FILT)
+float  volMult        = input.float(1.2, "  Volume Multiplier", minval = 0.0, step = 0.1, group = G_FILT)
+bool   avoidLowVolWin = input.bool(false, "Avoid Low-Volume Window", inline = "lv", group = G_FILT)
+string lowVolSess     = input.session("1130-1330", "", inline = "lv", group = G_FILT,
+     tooltip = "No new entries inside this window (default = New York lunch).")
+bool   avoidLowRelVol = input.bool(false, "Avoid Low Relative Volume", group = G_FILT,
+     tooltip = "Skip entries when SMA(volume,5) / SMA(volume,Length) is below the minimum ratio.")
+int    relVolLen      = input.int(50, "  Relative Volume Length", minval = 5, group = G_FILT)
+float  relVolMin      = input.float(0.6, "  Min Relative Volume Ratio", minval = 0.0, step = 0.05, group = G_FILT)
+
+// ---- 6) Risk Management -----------------------------------------------------
+string sizeMode     = input.string("Fixed Contracts", "Position Sizing", options = ["Fixed Contracts", "% of Equity (Notional)", "Risk % of Equity"], group = G_RISK,
+     tooltip = "Fixed Contracts = always trade N contracts.\n% of Equity = notional value of the position as % of equity.\nRisk % of Equity = contracts sized so the fixed-stop distance risks X% of equity.\nDynamic modes are floored to whole contracts (min 1, max = Max Contracts).")
+int    fixedQty     = input.int(1, "Fixed Contracts", minval = 1, group = G_RISK)
+float  eqPct        = input.float(100.0, "% of Equity (Notional)", minval = 0.1, step = 1.0, group = G_RISK)
+float  riskPct      = input.float(1.0, "Risk % of Equity per Trade", minval = 0.01, step = 0.1, group = G_RISK)
+int    maxQty       = input.int(10, "Max Contracts (dynamic sizing)", minval = 1, group = G_RISK)
+bool   useMaxTrades = input.bool(false, "Max Trades per Day", inline = "mt", group = G_RISK)
+int    maxTrades    = input.int(3, "", minval = 1, inline = "mt", group = G_RISK)
+bool   useDailyLoss = input.bool(false, "Max Daily Loss ($)", inline = "dl", group = G_RISK)
+float  maxDailyLoss = input.float(1000.0, "", minval = 1.0, step = 50.0, inline = "dl", group = G_RISK,
+     tooltip = "When realized + open P/L for the trading day reaches -X, all positions are closed and no new entries are taken until the next day.")
+bool   useBE        = input.bool(false, "Break-Even Stop", group = G_RISK)
+float  beR          = input.float(1.0, "  Move to BE after (R multiple)", minval = 0.1, step = 0.1, group = G_RISK)
+int    beOffTicks   = input.int(1, "  BE Offset (ticks beyond entry)", minval = 0, group = G_RISK)
+
+// ---- 7) Visuals -------------------------------------------------------------
+bool   showEma    = input.bool(true, "Show EMA", inline = "e", group = G_VIS)
+color  emaColor   = input.color(color.orange, "", inline = "e", group = G_VIS)
+bool   showVwap   = input.bool(true, "Show VWAP", inline = "v", group = G_VIS)
+color  vwapColor  = input.color(color.fuchsia, "", inline = "v", group = G_VIS)
+bool   showLevels = input.bool(true, "Show Entry / SL / TP Levels", group = G_VIS)
+bool   showBg     = input.bool(false, "Bullish / Bearish Background", group = G_VIS)
+bool   showDash   = input.bool(true, "Show Performance Dashboard", group = G_VIS)
+string dashPos    = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = G_VIS)
+
+// =============================================================================
+// INDICATORS
+// =============================================================================
+float cumVol = ta.cum(nz(volume))
+if barstate.islast and cumVol == 0
+    runtime.error("This symbol has no volume data, so VWAP cannot be calculated.")
+
+// VWAP anchor: decides when the VWAP accumulation resets.
+bool inRTH     = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+bool rthOpen   = inRTH and not inRTH[1]
+bool vwapReset = switch vwapAnchor
+    "RTH (09:30 NY)" => rthOpen
+    "Week"           => timeframe.change("1W")
+    "Month"          => timeframe.change("1M")
+    => timeframe.change("1D")
+
+float emaChart  = ta.ema(emaSrc, emaLen)
+float vwapChart = ta.vwap(vwapSrc, vwapReset)
+
+// Optional higher signal timeframe. [1] + lookahead_on returns the value of the
+// LAST COMPLETED higher-timeframe bar, which never changes after the fact.
+if useSigTF and timeframe.in_seconds(sigTFIn) < timeframe.in_seconds(timeframe.period)
+    runtime.error("Signal timeframe must be greater than or equal to the chart timeframe.")
+bool htfActive = useSigTF and timeframe.in_seconds(sigTFIn) > timeframe.in_seconds(timeframe.period)
+[emaHTF, vwapHTF, closeHTF] = request.security(syminfo.tickerid, sigTFIn, [emaChart[1], vwapChart[1], close[1]], lookahead = barmerge.lookahead_on)
+
+float emaVal   = htfActive ? emaHTF   : emaChart
+float vwapVal  = htfActive ? vwapHTF  : vwapChart
+float closeSig = htfActive ? closeHTF : close
+
+// =============================================================================
+// SIGNALS
+// =============================================================================
+bool bullCross = ta.crossover(emaVal, vwapVal)
+bool bearCross = ta.crossunder(emaVal, vwapVal)
+
+// Optional candle-close confirmation: signal candle closes beyond both lines.
+bool longConfirm  = not confirmClose or (closeSig > emaVal and closeSig > vwapVal)
+bool shortConfirm = not confirmClose or (closeSig < emaVal and closeSig < vwapVal)
+
+// =============================================================================
+// FILTERS (each one passes automatically when disabled)
+// =============================================================================
+bool  inSession   = not na(time(timeframe.period, sessIn, sessTZ))
+bool  sessionOK   = not useSession or inSession
+float distReq     = distUnit == "Points" ? minDist : minDist * syminfo.mintick
+bool  distOK      = not useMinDist or math.abs(emaVal - vwapVal) >= distReq
+float volAvg      = ta.sma(volume, volLen)
+bool  volOK       = not useVolFilter or volume >= volAvg * volMult
+bool  inLowVolWin = not na(time(timeframe.period, lowVolSess, sessTZ))
+bool  lowWinOK    = not avoidLowVolWin or not inLowVolWin
+float relVol      = ta.sma(volume, 5) / ta.sma(volume, relVolLen)
+bool  relVolOK    = not avoidLowRelVol or relVol >= relVolMin
+bool  allowLong   = tradeDirection != "Short Only"
+bool  allowShort  = tradeDirection != "Long Only"
+
+// =============================================================================
+// DAILY RISK TRACKING (trading day = exchange session day)
+// =============================================================================
+bool newDay = timeframe.change("1D")
+var float dayStartNet    = 0.0
+var int   tradesToday    = 0
+var int   prevTradeCount = 0
+var bool  dayLocked      = false
+if newDay
+    dayStartNet := strategy.netprofit
+    tradesToday := 0
+    dayLocked   := false
+
+// Every new entry increases closed + open trade count by one.
+int tradeCount = strategy.closedtrades + strategy.opentrades
+if tradeCount > prevTradeCount
+    tradesToday += tradeCount - prevTradeCount
+prevTradeCount := tradeCount
+
+float dayPnL   = strategy.netprofit - dayStartNet + strategy.openprofit
+bool  tradesOK = not useMaxTrades or tradesToday < maxTrades
+
+if useDailyLoss and not dayLocked and dayPnL <= -maxDailyLoss
+    dayLocked := true
+    strategy.close_all(comment = "Daily Loss")
+
+if useSession and flatOutside and not inSession and strategy.position_size != 0
+    strategy.close_all(comment = "Session End")
+
+// =============================================================================
+// HELPERS: stop / target distance and position size
+// =============================================================================
+float rrMult = switch rrSel
+    "1:1"   => 1.0
+    "1:1.5" => 1.5
+    "1:3"   => 3.0
+    => 2.0
+
+// Fixed-stop distance in price units (also used as 1R).
+f_stopDistance(float refPrice) =>
+    switch stopMode
+        "Points" => stopPts
+        "Ticks"  => stopTicks * syminfo.mintick
+        => refPrice * stopPct / 100.0
+
+// Take-profit distance in price units (na = no limit order).
+f_targetDistance(float riskDist) =>
+    switch tpMode
+        "Risk:Reward"  => riskDist * rrMult
+        "Fixed Points" => tpPts
+        "Fixed Ticks"  => tpTicks * syminfo.mintick
+        => float(na)
+
+// Returns [riskDistance, stopPrice, targetPrice] for a direction and entry price.
+f_levels(int dir, float price) =>
+    float risk = f_stopDistance(price)
+    float tgtD = f_targetDistance(risk)
+    float stp  = useFixedStop ? price - dir * risk : na
+    float tgt  = na(tgtD) ? na : price + dir * tgtD
+    [risk, stp, tgt]
+
+// Number of contracts for a new trade.
+f_qty(float refPrice, float riskDist) =>
+    float pv  = syminfo.pointvalue
+    float raw = switch sizeMode
+        "% of Equity (Notional)" => strategy.equity * eqPct / 100.0 / (refPrice * pv)
+        "Risk % of Equity"       => strategy.equity * riskPct / 100.0 / (riskDist * pv)
+        => float(fixedQty)
+    sizeMode == "Fixed Contracts" ? float(fixedQty) : float(math.min(math.max(math.floor(nz(raw, 1.0)), 1), maxQty))
+
+// =============================================================================
+// TRADE STATE
+// =============================================================================
+var int   tDir    = 0      // 1 = long, -1 = short, 0 = none
+var float tEntry  = na     // reference entry price
+var float tRisk   = na     // 1R distance (price units)
+var float tStop   = na     // active hard stop price
+var float tTarget = na     // active take-profit price
+var bool  tSynced = false  // levels re-based on the actual fill price
+var bool  tBE     = false  // break-even already applied
+
+bool inLong  = strategy.position_size > 0
+bool inShort = strategy.position_size < 0
+bool flat    = strategy.position_size == 0
+
+// Once the entry has filled, re-base SL/TP on the real average fill price.
+if (inLong or inShort) and not tSynced
+    tDir := inLong ? 1 : -1
+    [r, s, t] = f_levels(tDir, strategy.position_avg_price)
+    tEntry  := strategy.position_avg_price
+    tRisk   := r
+    tStop   := s
+    tTarget := t
+    tSynced := true
+
+// Optional break-even: once price has moved beR x 1R in favour, pull the stop
+// to entry (+ offset). Checked on bar close, active from the next bar.
+if useBE and (inLong or inShort) and tSynced and not tBE and not na(tRisk)
+    float beTrigger = tEntry + tDir * tRisk * beR
+    bool  reached   = tDir == 1 ? high >= beTrigger : low <= beTrigger
+    if reached
+        float beLevel = tEntry + tDir * beOffTicks * syminfo.mintick
+        tStop := na(tStop) ? beLevel : tDir == 1 ? math.max(tStop, beLevel) : math.min(tStop, beLevel)
+        tBE   := true
+
+// =============================================================================
+// CLOSE-BASED EXITS (evaluated on bar close, filled at next bar open)
+// =============================================================================
+if inLong
+    if useEmaStop and closeSig < emaVal
+        strategy.close("Long", comment = close > strategy.position_avg_price ? "EMA Exit" : "EMA SL")
+    else if tpMode == "Opposite Crossover" and bearCross
+        strategy.close("Long", comment = "Opp Cross")
+    else if tpMode == "EMA 9 Close (in profit)" and closeSig < emaVal and close > strategy.position_avg_price
+        strategy.close("Long", comment = "EMA TP")
+
+if inShort
+    if useEmaStop and closeSig > emaVal
+        strategy.close("Short", comment = close < strategy.position_avg_price ? "EMA Exit" : "EMA SL")
+    else if tpMode == "Opposite Crossover" and bullCross
+        strategy.close("Short", comment = "Opp Cross")
+    else if tpMode == "EMA 9 Close (in profit)" and closeSig > emaVal and close < strategy.position_avg_price
+        strategy.close("Short", comment = "EMA TP")
+
+// =============================================================================
+// ENTRIES (only when flat -> no pyramiding, no reversals)
+// =============================================================================
+bool canTrade    = flat and barstate.isconfirmed and sessionOK and distOK and volOK and lowWinOK and relVolOK and tradesOK and not dayLocked
+bool longSignal  = canTrade and allowLong and bullCross and longConfirm
+bool shortSignal = canTrade and allowShort and bearCross and shortConfirm
+
+if longSignal
+    // Provisional levels from the signal close so the bracket is live on the
+    // fill bar; they are re-based on the real fill price on the next bar.
+    [r, s, t] = f_levels(1, close)
+    tDir    := 1
+    tEntry  := close
+    tRisk   := r
+    tStop   := s
+    tTarget := t
+    tSynced := false
+    tBE     := false
+    strategy.entry("Long", strategy.long, qty = f_qty(close, r), comment = "Long")
+else if shortSignal
+    [r, s, t] = f_levels(-1, close)
+    tDir    := -1
+    tEntry  := close
+    tRisk   := r
+    tStop   := s
+    tTarget := t
+    tSynced := false
+    tBE     := false
+    strategy.entry("Short", strategy.short, qty = f_qty(close, r), comment = "Short")
+
+// =============================================================================
+// PRICE-BASED EXITS: hard stop / break-even, take-profit limit, trailing stop
+// =============================================================================
+float trailPtsTicks = useTrail ? trailActPts / syminfo.mintick : na
+float trailOffTicks = useTrail ? math.max(trailOffPts / syminfo.mintick, 1.0) : na
+bool  hasBracket    = not na(tStop) or not na(tTarget) or useTrail
+string slComment    = tBE ? "BE" : "SL"
+
+if hasBracket and tDir == 1 and (inLong or longSignal)
+    strategy.exit("Long Exit", from_entry = "Long", stop = tStop, limit = tTarget, trail_points = trailPtsTicks, trail_offset = trailOffTicks, comment_loss = slComment, comment_profit = "TP", comment_trailing = "Trail")
+if hasBracket and tDir == -1 and (inShort or shortSignal)
+    strategy.exit("Short Exit", from_entry = "Short", stop = tStop, limit = tTarget, trail_points = trailPtsTicks, trail_offset = trailOffTicks, comment_loss = slComment, comment_profit = "TP", comment_trailing = "Trail")
+
+// Flat with nothing pending: clear state and any leftover exit orders.
+if flat and not longSignal and not shortSignal
+    tDir    := 0
+    tEntry  := na
+    tRisk   := na
+    tStop   := na
+    tTarget := na
+    tSynced := false
+    tBE     := false
+    strategy.cancel("Long Exit")
+    strategy.cancel("Short Exit")
+
+// =============================================================================
+// CHART VISUALS
+// =============================================================================
+plot(showEma ? emaVal : na, "EMA", emaColor, 2)
+plot(showVwap ? vwapVal : na, "VWAP", vwapColor, 2)
+
+// Arrows are drawn on the bar where the market order fills (signal bar + 1).
+// offset = 1 only shifts the drawing; the signal itself is from a closed bar.
+plotshape(longSignal, "Long Entry", shape.arrowup, location.belowbar, color.new(color.green, 0), offset = 1, text = "L", textcolor = color.green, size = size.normal)
+plotshape(shortSignal, "Short Entry", shape.arrowdown, location.abovebar, color.new(color.red, 0), offset = 1, text = "S", textcolor = color.red, size = size.normal)
+
+bool inPos = inLong or inShort
+plot(showLevels and inPos ? tEntry : na, "Entry Level", color.new(color.gray, 0), 1, plot.style_linebr)
+plot(showLevels and inPos ? tStop : na, "Stop-Loss Level", color.new(color.red, 0), 2, plot.style_linebr)
+plot(showLevels and inPos ? tTarget : na, "Take-Profit Level", color.new(color.green, 0), 2, plot.style_linebr)
+
+bgcolor(showBg ? (emaVal > vwapVal ? color.new(color.green, 90) : color.new(color.red, 90)) : na, title = "Bull/Bear Background")
+
+// =============================================================================
+// PERFORMANCE STATISTICS
+// =============================================================================
+// Long vs short breakdown, accumulated incrementally from closed trades.
+var int   lTrades = 0
+var int   lWins   = 0
+var float lNet    = 0.0
+var int   sTrades = 0
+var int   sWins   = 0
+var float sNet    = 0.0
+var int   lastIdx = 0
+if strategy.closedtrades > lastIdx
+    for i = lastIdx to strategy.closedtrades - 1
+        float pnl = strategy.closedtrades.profit(i)
+        if strategy.closedtrades.size(i) > 0
+            lTrades += 1
+            lWins   += pnl > 0 ? 1 : 0
+            lNet    += pnl
+        else
+            sTrades += 1
+            sWins   += pnl > 0 ? 1 : 0
+            sNet    += pnl
+    lastIdx := strategy.closedtrades
+
+f_money(float v) =>
+    na(v) ? "-" : str.tostring(v, "#,##0.00") + " " + strategy.account_currency
+
+f_pct(float v) =>
+    na(v) ? "-" : str.tostring(v, "0.0") + "%"
+
+f_tablePos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+var table dash = table.new(f_tablePos(dashPos), 2, 14, bgcolor = color.new(color.black, 25), border_color = color.new(color.gray, 70), border_width = 1)
+
+f_row(int row, string k, string v, color c) =>
+    table.cell(dash, 0, row, k, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, row, v, text_color = c, text_size = size.small, text_halign = text.align_right)
+
+if showDash and barstate.islast
+    int   tot     = strategy.closedtrades
+    int   wins    = strategy.wintrades
+    int   losses  = strategy.losstrades
+    float winRate = tot > 0 ? float(wins) / tot * 100.0 : na
+    float pf      = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float avgWin  = wins > 0 ? strategy.grossprofit / wins : na
+    float avgLoss = losses > 0 ? strategy.grossloss / losses : na
+    float avgRR   = not na(avgWin) and not na(avgLoss) and avgLoss > 0 ? avgWin / avgLoss : na
+    float ddPct   = strategy.max_drawdown / strategy.initial_capital * 100.0
+    float lWR     = lTrades > 0 ? float(lWins) / lTrades * 100.0 : na
+    float sWR     = sTrades > 0 ? float(sWins) / sTrades * 100.0 : na
+    color up      = color.new(color.lime, 0)
+    color dn      = color.new(color.red, 0)
+    color neu     = color.white
+    string posTxt = inLong ? "LONG " + str.tostring(strategy.position_size) : inShort ? "SHORT " + str.tostring(math.abs(strategy.position_size)) : "FLAT"
+
+    f_row(0, "VWAP x EMA" + str.tostring(emaLen), syminfo.ticker + " " + timeframe.period, color.yellow)
+    f_row(1, "Total Trades", str.tostring(tot), neu)
+    f_row(2, "Win Rate", f_pct(winRate), neu)
+    f_row(3, "Profit Factor", na(pf) ? "-" : str.tostring(pf, "0.00"), na(pf) ? neu : pf >= 1 ? up : dn)
+    f_row(4, "Net Profit", f_money(strategy.netprofit), strategy.netprofit >= 0 ? up : dn)
+    f_row(5, "Max Drawdown", f_money(strategy.max_drawdown) + " (" + f_pct(ddPct) + ")", dn)
+    f_row(6, "Avg Winning Trade", f_money(avgWin), up)
+    f_row(7, "Avg Losing Trade", f_money(na(avgLoss) ? na : -avgLoss), dn)
+    f_row(8, "Avg R:R (Win/Loss)", na(avgRR) ? "-" : "1:" + str.tostring(avgRR, "0.00"), neu)
+    f_row(9, "Long", str.tostring(lTrades) + " | " + f_pct(lWR) + " | " + f_money(lNet), lNet >= 0 ? up : dn)
+    f_row(10, "Short", str.tostring(sTrades) + " | " + f_pct(sWR) + " | " + f_money(sNet), sNet >= 0 ? up : dn)
+    f_row(11, "Today (trades | P/L)", str.tostring(tradesToday) + " | " + f_money(dayPnL), dayPnL >= 0 ? up : dn)
+    f_row(12, "Position", posTxt, inLong ? up : inShort ? dn : neu)
+    f_row(13, "Status", dayLocked ? "LOCKED (daily loss)" : useMaxTrades and not tradesOK ? "Max trades reached" : "Active", dayLocked or (useMaxTrades and not tradesOK) ? dn : up)
